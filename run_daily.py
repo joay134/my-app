@@ -2,15 +2,13 @@
 """Enhanced CN A-shares analyzer.
 
 This script implements an industry → funds → fundamentals → technicals
-pipeline with an entry zone check.  It fetches the most active A-share
+pipeline with an entry zone check. It fetches the most active A-share
 stocks, filters them by industry heat, computes multiple factor scores and
 produces HTML/CSV reports under ``./reports``.
 
-The implementation aims to follow the specification in the user request.  It
-is intentionally lightweight and focuses on orchestrating the data pipeline
-rather than on absolute financial accuracy.  All external data fetches are
-wrapped in ``try/except`` blocks so that per-stock failures do not abort the
-run.
+All external data fetches are wrapped in try/except blocks so that
+per-stock failures do not abort the run. In addition, turnover-pool fetching
+has graceful network fallback (Eastmoney → Sina) and empty-pool handling.
 """
 
 from __future__ import annotations
@@ -26,6 +24,7 @@ import akshare as ak
 import numpy as np
 import pandas as pd
 from jinja2 import Template
+from requests.exceptions import RequestException, ConnectionError  # for readability
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +46,6 @@ class IndustryInfo:
 
 def zscore(series: pd.Series) -> pd.Series:
     """Return z-scored series; NaNs remain NaN."""
-
     mean = series.mean()
     std = series.std(ddof=0)
     if std == 0 or np.isnan(std):
@@ -55,20 +53,100 @@ def zscore(series: pd.Series) -> pd.Series:
     return (series - mean) / std
 
 
+# -------------------- TURNOVER POOL (with graceful fallback) ----------------
 def get_top_turnover(limit: int) -> pd.DataFrame:
-    """Fetch real-time spot data sorted by turnover amount."""
+    """
+    Fetch real-time spot data sorted by turnover amount.
 
-    spot = ak.stock_zh_a_spot_em()
-    spot = spot.sort_values("成交额", ascending=False).head(limit)
-    cols = ["代码", "名称", "最新价", "涨跌幅", "成交额"]
-    spot = spot[cols]
-    spot.columns = ["code", "name", "close", "change_pct", "turnover"]
-    return spot
+    Primary source: Eastmoney (ak.stock_zh_a_spot_em).
+    Fallback     : Sina       (ak.stock_zh_a_spot), with amount in 10k CNY.
+    Returns DataFrame with columns: code, name, close, change_pct, turnover(元).
+    """
+    # --- Try Eastmoney ---
+    try:
+        df = ak.stock_zh_a_spot_em()
+        # Expected columns: 代码, 名称, 最新价, 涨跌幅, 成交额(或 成交额)
+        # Normalize turnover
+        if "成交额" in df.columns:
+            df["turnover"] = pd.to_numeric(df["成交额"], errors="coerce")
+        elif "成交额(元)" in df.columns:
+            df["turnover"] = pd.to_numeric(df["成交额(元)"], errors="coerce")
+        elif "amount" in df.columns:
+            df["turnover"] = pd.to_numeric(df["amount"], errors="coerce")
+        else:
+            df["turnover"] = pd.NA
+
+        out = df.copy()
+        out = out.rename(
+            columns={
+                "代码": "code",
+                "名称": "name",
+                "最新价": "close",
+                "涨跌幅": "change_pct",
+            }
+        )
+        out = out.dropna(subset=["turnover"]).sort_values("turnover", ascending=False).head(limit)
+        return out[["code", "name", "close", "change_pct", "turnover"]]
+    except Exception as e:
+        print(f"[warn] Eastmoney spot API failed: {e}")
+
+    # --- Fallback: Sina ---
+    try:
+        df2 = ak.stock_zh_a_spot()
+        # Typical columns (may vary): symbol, name, trade, changepercent, amount(万元)
+        out2 = pd.DataFrame()
+        # code
+        if "symbol" in df2.columns:
+            out2["code"] = df2["symbol"]
+        elif "代码" in df2.columns:
+            out2["code"] = df2["代码"]
+        else:
+            out2["code"] = df2.get("code")
+
+        # name
+        if "name" in df2.columns:
+            out2["name"] = df2["name"]
+        elif "名称" in df2.columns:
+            out2["name"] = df2["名称"]
+
+        # close
+        if "trade" in df2.columns:
+            out2["close"] = pd.to_numeric(df2["trade"], errors="coerce")
+        elif "最新价" in df2.columns:
+            out2["close"] = pd.to_numeric(df2["最新价"], errors="coerce")
+        else:
+            out2["close"] = pd.NA
+
+        # change pct
+        if "changepercent" in df2.columns:
+            out2["change_pct"] = pd.to_numeric(df2["changepercent"], errors="coerce")
+        elif "涨跌幅" in df2.columns:
+            out2["change_pct"] = pd.to_numeric(df2["涨跌幅"], errors="coerce")
+        else:
+            out2["change_pct"] = pd.NA
+
+        # turnover (amount usually in 10k CNY on Sina)
+        if "amount" in df2.columns:
+            out2["turnover"] = pd.to_numeric(df2["amount"], errors="coerce") * 1e4
+        elif "成交额" in df2.columns:
+            out2["turnover"] = pd.to_numeric(df2["成交额"], errors="coerce")
+        else:
+            out2["turnover"] = pd.NA
+
+        out2 = out2.dropna(subset=["turnover"]).sort_values("turnover", ascending=False).head(limit)
+        # Ensure column order exists
+        for col in ["code", "name", "close", "change_pct"]:
+            if col not in out2.columns:
+                out2[col] = pd.NA
+        return out2[["code", "name", "close", "change_pct", "turnover"]]
+    except Exception as e2:
+        print(f"[error] Fallback (Sina) also failed: {e2}")
+        # final fallback: empty DF lets main() exit gracefully
+        return pd.DataFrame(columns=["code", "name", "close", "change_pct", "turnover"])
 
 
 def get_industry_mapping() -> Dict[str, str]:
     """Return mapping of industry name to board code."""
-
     boards = ak.stock_board_industry_name_em()
     mapping = dict(zip(boards["板块名称"], boards["板块代码"]))
     return mapping
@@ -76,7 +154,6 @@ def get_industry_mapping() -> Dict[str, str]:
 
 def stock_industry(code: str) -> Optional[str]:
     """Fetch primary industry for a stock."""
-
     try:
         info = ak.stock_individual_info_em(symbol=code)
         industry = info.loc[info["item"] == "所属行业", "value"].iloc[0]
@@ -87,6 +164,8 @@ def stock_industry(code: str) -> Optional[str]:
 
 def compute_industry_scores(stocks: pd.DataFrame, top_k: int) -> pd.DataFrame:
     """Compute industry heat metrics and return top-k industries."""
+    if "industry" not in stocks.columns or stocks["industry"].dropna().empty:
+        return pd.DataFrame()
 
     mapping = get_industry_mapping()
     industries = {}
@@ -153,11 +232,14 @@ def compute_technicals(df: pd.DataFrame) -> pd.DataFrame:
     df["vol_spike"] = df["volume"] > df["vol_ma20"] * 1.5
 
     # True range and ATR14
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"] - df["close"].shift()).abs(),
-    ], axis=1).max(axis=1)
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - df["close"].shift()).abs(),
+            (df["low"] - df["close"].shift()).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
     df["ATR14"] = tr.rolling(14).mean()
 
     return df
@@ -199,7 +281,7 @@ def generate_report(date_str: str, stocks: pd.DataFrame, industries: pd.DataFram
     template = Template(
         """
         <html>
-        <head><meta charset=\"utf-8\"><title>Daily A-shares Report {{ date }}</title></head>
+        <head><meta charset="utf-8"><title>Daily A-shares Report {{ date }}</title></head>
         <body>
         <h1>Daily A-shares Report {{ date }}</h1>
         <h2>Top Industries</h2>
@@ -241,23 +323,55 @@ def main() -> None:
     start = (today - dt.timedelta(days=365 * 2)).strftime("%Y%m%d")
     end = today.strftime("%Y%m%d")
 
+    # ------------ Turnover pool with graceful handling ------------
     spot = get_top_turnover(args.top)
+
+    # 如果池子为空（网络不可达/接口失败），优雅退出并生成占位报告
+    if spot is None or len(spot) == 0:
+        print("[warn] 无法获取成交额池（数据源暂时不可达）。将优雅退出并生成提示文件。")
+        out_dir = "reports"
+        os.makedirs(out_dir, exist_ok=True)
+        # 占位 CSV（避免 artifacts 为空）
+        pd.DataFrame(
+            [{"提示": "数据源当前不可达（东方财富/新浪）。请稍后在 Actions 中 Re-run jobs 再试。"}]
+        ).to_csv(os.path.join(out_dir, "placeholder.csv"), index=False, encoding="utf-8-sig")
+        # 占位 HTML
+        placeholder_html = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>每日选股报告 - 数据源不可达</title>
+<style>body{font-family:"Noto Sans SC","Microsoft YaHei","PingFang SC",Arial,sans-serif;padding:24px;line-height:1.6}
+.card{max-width:880px;border:1px solid #eee;border-radius:12px;padding:20px;background:#fff}
+h1{font-size:22px;margin:0 0 12px} p{margin:6px 0}</style>
+</head><body>
+<div class="card">
+<h1>数据源暂时不可达</h1>
+<p>无法连接行情接口（例如 push2.eastmoney.com），或网络暂时不通。</p>
+<p>请稍后在 <b>Actions</b> 页面点击 <b>Re-run jobs</b> 重试。</p>
+<p>（本次已生成占位文件以保持工作流成功）</p>
+</div>
+</body></html>"""
+        with open(os.path.join(out_dir, "index.html"), "w", encoding="utf-8") as f:
+            f.write(placeholder_html)
+        return  # 正常退出，Actions 显示成功
 
     # Map industry for each stock
     industries = []
     for code in spot["code"]:
-        industries.append(stock_industry(code))
+        try:
+            industries.append(stock_industry(code))
+        except Exception:
+            industries.append(None)
     spot["industry"] = industries
 
     ind_scores = compute_industry_scores(spot, args.ind_top_k)
     if ind_scores.empty:
-        top_industries = []
+        top_industries: List[str] = []
     else:
-        top_industries = ind_scores.index.tolist()
+        top_industries = list(ind_scores.index)
 
     results: List[dict] = []
     for _, row in spot.iterrows():
-        if row["industry"] not in top_industries:
+        if top_industries and row["industry"] not in top_industries:
             continue
         code = row["code"]
         try:
@@ -273,8 +387,8 @@ def main() -> None:
                     "name": row["name"],
                     "industry": row["industry"],
                     "close": latest["close"],
-                    "change_pct": row["change_pct"],
-                    "IndustryScore": ind_scores.loc[row["industry"], "IndustryScore"],
+                    "change_pct": row.get("change_pct", np.nan),
+                    "IndustryScore": ind_scores.loc[row["industry"], "IndustryScore"] if not ind_scores.empty and row["industry"] in ind_scores.index else 0.0,
                     "FlowScore": 0.0,
                     "FundScore": 0.0,
                     "TechScore": tscore,
@@ -287,17 +401,24 @@ def main() -> None:
     df = pd.DataFrame(results)
     if df.empty:
         print("No data available")
+        # 也生成一个占位，防止没有 artifacts
+        out_dir = "reports"
+        os.makedirs(out_dir, exist_ok=True)
+        pd.DataFrame([{"提示": "没有符合条件的股票或数据不足"}]).to_csv(
+            os.path.join(out_dir, "placeholder_empty.csv"), index=False, encoding="utf-8-sig"
+        )
         return
 
     # Normalize scores
-    df["FlowScore"] = df["FlowScore"].fillna(df["FlowScore"].median())
-    df["FundScore"] = df["FundScore"].fillna(df["FundScore"].median())
-    df["TechScore"] = df["TechScore"].fillna(df["TechScore"].median())
+    for col in ["FlowScore", "FundScore", "TechScore"]:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = df[col].fillna(df[col].median() if not df[col].dropna().empty else 0.0)
 
     df["z_flow"] = zscore(df["FlowScore"])
     df["z_fund"] = zscore(df["FundScore"])
     df["z_tech"] = zscore(df["TechScore"])
-    df["z_ind"] = zscore(df["IndustryScore"])
+    df["z_ind"] = zscore(df.get("IndustryScore", pd.Series([0] * len(df))))
 
     composite = (
         args.w_ind * df["z_ind"]
@@ -310,6 +431,7 @@ def main() -> None:
         composite += args.w_ml * df["z_ml"]
     df["Composite"] = composite
 
+    # Sort & rank (desc by Composite; tie-break by change_pct)
     df.sort_values(["Composite", "change_pct"], ascending=[False, False], inplace=True)
     df.reset_index(drop=True, inplace=True)
     df["Final Rank"] = df.index + 1
@@ -326,10 +448,9 @@ def main() -> None:
     generate_report(today.strftime("%Y-%m-%d"), display_df, ind_display)
 
     print(
-        f"training samples: {len(df)} (universe={len(spot)}, features=3); top industries: {', '.join(top_industries)}"
+        f"training samples: {len(df)} (universe={len(spot)}, features=3); top industries: {', '.join(top_industries) if top_industries else 'N/A'}"
     )
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
     main()
-
