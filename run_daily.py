@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""A 股日选股分析（行业→资金→基本面→技术，含入场/每行业TopN，中文报表、网络容错）
+"""
+A 股日选股分析（行业→资金→基本面→技术，含入场/每行业TopN，中文报表、网络容错）
 
 - 成交额池：东财→新浪降级；失败则优雅退出并写入占位报告
-- 行业映射：用“行业板块成分”反向映射，保证行业热度可计算
+- 行业映射：用“行业板块成分”反向映射，Eastmoney/同花顺双兜底；拿不到行业时自动跳过行业打分
 - 资金分 FlowScore：量能放大（量/20日均量）+ 成交额 + 北向Top10命中（若接口可用）
 - 基本面 FundScore：ROE、营收同比、归母净利同比、资产负债率（负债率越低越好）
 - 技术分 TechScore：MA20>MA60、价格落在MA20附近带、RSI区间、距20日新高≤阈值
-- 入场阈值参数化、只看入场、每行业TopN
+- 入场阈值参数化、只看入场、每行业TopN（仅在 industry 有效时生效）
 - 报表中文，空池/失败不报红
 """
 
@@ -42,6 +43,7 @@ def get_top_turnover(limit: int) -> pd.DataFrame:
     # Eastmoney
     try:
         df = ak.stock_zh_a_spot_em()
+        # 兼容不同字段名
         if "成交额" in df.columns:
             df["turnover"] = pd.to_numeric(df["成交额"], errors="coerce")
         elif "成交额(元)" in df.columns:
@@ -69,6 +71,7 @@ def get_top_turnover(limit: int) -> pd.DataFrame:
         out2["close"] = pd.to_numeric(df2.get("trade", df2.get("最新价")), errors="coerce")
         out2["change_pct"] = pd.to_numeric(df2.get("changepercent", df2.get("涨跌幅")), errors="coerce")
         if "amount" in df2.columns:
+            # 新浪 amount 单位为“万”，换算为元
             out2["turnover"] = pd.to_numeric(df2["amount"], errors="coerce") * 1e4
         elif "成交额" in df2.columns:
             out2["turnover"] = pd.to_numeric(df2["成交额"], errors="coerce")
@@ -85,51 +88,142 @@ def get_top_turnover(limit: int) -> pd.DataFrame:
         return pd.DataFrame(columns=["code", "name", "close", "change_pct", "turnover"])
 
 
-# ---------------------- 行业映射/热度 ----------------------
+# ---------------------- 行业映射/热度（双兜底） ----------------------
 
 def _board_name_code_map() -> Dict[str, str]:
-    boards = ak.stock_board_industry_name_em()
-    return dict(zip(boards["板块名称"], boards["板块代码"]))
+    """
+    行业名称 -> 板块代码 的映射。
+    先试东财；失败再试同花顺；都失败返回 {}（让上层优雅跳过行业打分）。
+    """
+    # 1) Eastmoney
+    try:
+        b = ak.stock_board_industry_name_em()
+        if not b.empty:
+            return dict(zip(b["板块名称"], b["板块代码"]))
+    except Exception as e:
+        print(f"[warn] industry_name_em failed: {e}")
+
+    # 2) THS
+    try:
+        if hasattr(ak, "stock_board_industry_name_ths"):
+            b = ak.stock_board_industry_name_ths()
+            if not b.empty:
+                if {"板块名称", "板块代码"} <= set(b.columns):
+                    return dict(zip(b["板块名称"], b["板块代码"]))
+                elif {"name", "code"} <= set(b.columns):
+                    return dict(zip(b["name"], b["code"]))
+    except Exception as e2:
+        print(f"[warn] industry_name_ths failed: {e2}")
+
+    return {}
+
 
 def map_industry_for_codes(codes: List[str]) -> Dict[str, str]:
-    """用行业板块成分反向映射：code -> 板块名称"""
+    """
+    通过“行业板块成分”反向映射：code -> 行业名称。
+    任一数据源失败时，返回 {}，让上层优雅退化。
+    """
     code_left: Set[str] = set(codes)
     result: Dict[str, str] = {}
-    boards = ak.stock_board_industry_name_em()
+
+    boards = pd.DataFrame()
+    # 先试东财
+    try:
+        boards = ak.stock_board_industry_name_em()
+    except Exception as e:
+        print(f"[warn] stock_board_industry_name_em failed: {e}")
+
+    # 再试 THS
+    if boards.empty and hasattr(ak, "stock_board_industry_name_ths"):
+        try:
+            boards = ak.stock_board_industry_name_ths()
+        except Exception as e2:
+            print(f"[warn] stock_board_industry_name_ths failed: {e2}")
+
+    if boards.empty:
+        return {}
+
+    # 统一行业名称列
+    if "板块名称" in boards.columns:
+        name_col = "板块名称"
+    elif "name" in boards.columns:
+        name_col = "name"
+    else:
+        return {}
+
+    # 逐行业取成分，匹配当前池子的 code
     for _, row in boards.iterrows():
-        bname = row["板块名称"]
+        bname = str(row[name_col])
+        cons = pd.DataFrame()
+
+        # 东财成分
         try:
             cons = ak.stock_board_industry_cons_em(symbol=bname)
-            cons_codes = set(cons["代码"].astype(str).str.zfill(6))
-            hit = cons_codes & code_left
-            if hit:
-                for c in hit: result[c] = bname
-                code_left -= hit
-                if not code_left: break
         except Exception:
+            pass
+
+        # THS 成分
+        if cons.empty and hasattr(ak, "stock_board_industry_cons_ths"):
+            try:
+                cons = ak.stock_board_industry_cons_ths(symbol=bname)
+            except Exception:
+                pass
+
+        if cons.empty:
             continue
+
+        # 统一代码列
+        code_col = None
+        for c in ["代码", "code", "股票代码", "symbol"]:
+            if c in cons.columns:
+                code_col = c
+                break
+        if code_col is None:
+            continue
+
+        cons_codes = set(cons[code_col].astype(str).str.zfill(6))
+        hit = cons_codes & code_left
+        if hit:
+            for c in hit:
+                result[c] = bname
+            code_left -= hit
+            if not code_left:
+                break
+
     return result
 
+
 def compute_industry_scores(spot: pd.DataFrame, top_k: int) -> pd.DataFrame:
-    """Δ5日成交额 + 5日涨幅 的 z 分，返回 top_k 行业"""
+    """Δ5日成交额 + 5日涨幅 的 z 分，返回 top_k 行业。拿不到映射则直接跳过。"""
     if spot.empty or "industry" not in spot.columns or spot["industry"].dropna().empty:
         return pd.DataFrame()
 
-    name_code = _board_name_code_map()
+    try:
+        name_code = _board_name_code_map()
+    except Exception as e:
+        print(f"[warn] _board_name_code_map error: {e}")
+        name_code = {}
+
+    if not name_code:
+        print("[warn] industry mapping unavailable, skip industry scoring.")
+        return pd.DataFrame()
+
     industries = {}
     today = dt.date.today().strftime("%Y%m%d")
     start = (dt.date.today() - dt.timedelta(days=40)).strftime("%Y%m%d")
 
     for ind in spot["industry"].dropna().unique():
         code = name_code.get(ind)
-        if not code: continue
+        if not code:
+            continue
         try:
             hist = ak.stock_board_industry_hist_em(symbol=code, start_date=start, end_date=today)
             hist["日期"] = pd.to_datetime(hist["日期"])
             hist.sort_values("日期", inplace=True)
             hist.set_index("日期", inplace=True)
             hist = hist.tail(10)
-            if len(hist) < 10: continue
+            if len(hist) < 10:
+                continue
             last5 = hist["成交额"].tail(5).sum()
             prev5 = hist["成交额"].head(5).sum()
             delta5 = (last5 - prev5) / prev5 if prev5 else 0.0
@@ -139,7 +233,8 @@ def compute_industry_scores(spot: pd.DataFrame, top_k: int) -> pd.DataFrame:
             continue
 
     ind_df = pd.DataFrame.from_dict(industries, orient="index")
-    if ind_df.empty: return pd.DataFrame()
+    if ind_df.empty:
+        return pd.DataFrame()
     ind_df["IndustryScore"] = zscore(ind_df["turnover_delta5"]) + 0.5 * zscore(ind_df["return5"])
     ind_df.sort_values("IndustryScore", ascending=False, inplace=True)
     return ind_df.head(top_k)
@@ -155,6 +250,7 @@ def fetch_history(code: str, start: str, end: str) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"])
     df.set_index("date", inplace=True)
     return df
+
 
 def compute_technicals(df: pd.DataFrame) -> pd.DataFrame:
     df["MA20"] = df["close"].rolling(20).mean()
@@ -172,30 +268,34 @@ def compute_technicals(df: pd.DataFrame) -> pd.DataFrame:
     df["20d_high"] = df["close"].rolling(20).max().shift(1)
 
     tr = pd.concat(
-        [df["high"]-df["low"], (df["high"]-df["close"].shift()).abs(), (df["low"]-df["close"].shift()).abs()],
+        [df["high"] - df["low"], (df["high"] - df["close"].shift()).abs(), (df["low"] - df["close"].shift()).abs()],
         axis=1
     ).max(axis=1)
     df["ATR14"] = tr.rolling(14).mean()
     return df
 
+
 def days_since_high20(df: pd.DataFrame) -> int:
     window = df["close"].iloc[-20:]
-    if window.empty: return 999
+    if window.empty:
+        return 999
     last_high = window.max()
     high_date = window[window == last_high].index[-1]
     return (df.index[-1] - high_date).days
 
+
 def entry_flag(latest: pd.Series, band_low: float, band_high: float, rsi_low: float, rsi_high: float, dsh20_max: int) -> int:
     cond1 = latest["MA20"] > latest["MA60"]
-    cond2 = band_low <= latest["close"]/latest["MA20"] - 1 <= band_high
+    cond2 = band_low <= latest["close"] / latest["MA20"] - 1 <= band_high
     cond3 = rsi_low <= latest["RSI14"] <= rsi_high
     cond4 = int(latest.get("days_since_high20", 999)) <= dsh20_max
     return int(cond1 and cond2 and cond3 and cond4)
 
+
 def tech_score(latest: pd.Series, band_low: float, band_high: float, rsi_low: float, rsi_high: float, dsh20_max: int) -> float:
     s = 0
     s += 1 if latest["MA20"] > latest["MA60"] else 0
-    s += 1 if band_low <= latest["close"]/latest["MA20"] - 1 <= band_high else 0
+    s += 1 if band_low <= latest["close"] / latest["MA20"] - 1 <= band_high else 0
     s += 1 if rsi_low <= latest["RSI14"] <= rsi_high else 0
     s += 1 if int(latest.get("days_since_high20", 999)) <= dsh20_max else 0
     return s / 4.0
@@ -207,12 +307,12 @@ def northbound_top10_hits(code: str, days: int = 10) -> int:
     """最近 N 天北向 Top10 命中次数（接口可用则统计；否则返回 0）"""
     try:
         end = dt.date.today().strftime("%Y%m%d")
-        start = (dt.date.today() - dt.timedelta(days=days*2)).strftime("%Y%m%d")
-        df = ak.stock_hsgt_top10_em(start_date=start, end_date=end)  # 若接口不可用会抛异常
+        start = (dt.date.today() - dt.timedelta(days=days * 2)).strftime("%Y%m%d")
+        df = ak.stock_hsgt_top10_em(start_date=start, end_date=end)
         code6 = str(code).zfill(6)
-        # 兼容不同列名
         code_col = "代码" if "代码" in df.columns else ("stock_code" if "stock_code" in df.columns else None)
-        if code_col is None: return 0
+        if code_col is None:
+            return 0
         return int((df[code_col].astype(str).str.zfill(6) == code6).sum())
     except Exception:
         return 0
@@ -222,14 +322,17 @@ def northbound_top10_hits(code: str, days: int = 10) -> int:
 
 def _latest_numeric(row_df: pd.DataFrame) -> Optional[float]:
     """从财务指标宽表里取最近一期有值的数字"""
-    if row_df.empty: return None
+    if row_df.empty:
+        return None
     cols = [c for c in row_df.columns if c != "指标"]
     for c in cols:  # 列一般按最近→最远
         v = pd.to_numeric(row_df[c], errors="coerce")
         if not pd.isna(v).all():
             val = v.iloc[0]
-            if pd.notna(val): return float(val)
+            if pd.notna(val):
+                return float(val)
     return None
+
 
 def fetch_fundamentals(code: str) -> dict:
     """返回 {'roe':..., 'rev_yoy':..., 'profit_yoy':..., 'debt_ratio':...}；失败返回 0"""
@@ -242,7 +345,8 @@ def fetch_fundamentals(code: str) -> dict:
             for kw in keywords:
                 mask = mask | df["指标"].astype(str).str.contains(kw)
             row = df.loc[mask]
-            if row.empty: return None
+            if row.empty:
+                return None
             return _latest_numeric(row.iloc[[0]])
 
         roe = pick(["净资产收益率", "ROE"])
@@ -250,10 +354,14 @@ def fetch_fundamentals(code: str) -> dict:
         prof = pick(["净利润同比", "归母净利润同比"])
         debt = pick(["资产负债率", "负债率"])
 
-        if roe is not None: out["roe"] = float(roe)
-        if rev is not None: out["rev_yoy"] = float(rev)
-        if prof is not None: out["profit_yoy"] = float(prof)
-        if debt is not None: out["debt_ratio"] = float(debt)
+        if roe is not None:
+            out["roe"] = float(roe)
+        if rev is not None:
+            out["rev_yoy"] = float(rev)
+        if prof is not None:
+            out["profit_yoy"] = float(prof)
+        if debt is not None:
+            out["debt_ratio"] = float(debt)
     except Exception:
         pass
     return out
@@ -272,12 +380,15 @@ def generate_report(date_str: str, stocks: pd.DataFrame, industries: pd.DataFram
         "TechScore": "技术分", "EntryFlag": "入场信号",
         "Composite": "综合分", "Final Rank": "最终排名",
     }
-    out_cols = ["code","name","industry","close","change_pct",
-                "IndustryScore","FlowScore","FundScore","TechScore","EntryFlag",
-                "Composite","Final Rank"]
+    out_cols = [
+        "code", "name", "industry", "close", "change_pct",
+        "IndustryScore", "FlowScore", "FundScore", "TechScore", "EntryFlag",
+        "Composite", "Final Rank",
+    ]
     df_csv = stocks.copy()
     for c in out_cols:
-        if c not in df_csv.columns: df_csv[c] = np.nan
+        if c not in df_csv.columns:
+            df_csv[c] = np.nan
     df_csv = df_csv[out_cols].rename(columns=zh_map)
     df_csv.to_csv(reports_dir / f"report_{date_str}.csv", index=False, encoding="utf-8-sig")
 
@@ -299,7 +410,7 @@ th:first-child,td:first-child{text-align:left}
 </body></html>""").render(
         date=date_str,
         industries=industries.rename(
-            columns={"turnover_delta5":"Δ5日成交额","return5":"5日涨幅","IndustryScore":"行业得分"}
+            columns={"turnover_delta5": "Δ5日成交额", "return5": "5日涨幅", "IndustryScore": "行业得分"}
         ).to_html(float_format="{:.2f}".format),
         stocks=df_csv.to_html(index=False, float_format="{:.2f}".format),
     )
@@ -334,18 +445,19 @@ def main() -> None:
     args = p.parse_args()
 
     today = dt.date.today()
-    start = (today - dt.timedelta(days=365*2)).strftime("%Y%m%d")
-    end   = today.strftime("%Y%m%d")
+    start = (today - dt.timedelta(days=365 * 2)).strftime("%Y%m%d")
+    end = today.strftime("%Y%m%d")
 
     # 1) 成交额池
     spot = get_top_turnover(args.top)
     if spot is None or len(spot) == 0:
         print("[warn] 无法获取成交额池，优雅退出。")
-        out_dir = "reports"; os.makedirs(out_dir, exist_ok=True)
-        pd.DataFrame([{"提示":"数据源暂不可达，请稍后重试"}]).to_csv(
-            os.path.join(out_dir,"placeholder.csv"), index=False, encoding="utf-8-sig"
+        out_dir = "reports"
+        os.makedirs(out_dir, exist_ok=True)
+        pd.DataFrame([{"提示": "数据源暂不可达，请稍后重试"}]).to_csv(
+            os.path.join(out_dir, "placeholder.csv"), index=False, encoding="utf-8-sig"
         )
-        with open(os.path.join(out_dir,"index.html"),"w",encoding="utf-8") as f:
+        with open(os.path.join(out_dir, "index.html"), "w", encoding="utf-8") as f:
             f.write("<meta charset='utf-8'><h3>数据源暂不可达，请稍后重试。</h3>")
         return
 
@@ -361,19 +473,27 @@ def main() -> None:
     # 4) 逐股：历史/技术 + 资金原始因子 + 基本面原始因子
     rows = []
     for _, r in spot.iterrows():
-        if top_industries and r["industry"] not in top_industries:  # 只留热门行业池
+        # 仅保留热门行业；若没有行业映射/行业打分，则不过滤
+        if top_industries and r["industry"] not in top_industries:
             continue
         code = str(r["code"]).zfill(6)
         try:
             hist = fetch_history(code, start, end)
-            if hist.empty: continue
+            if hist.empty:
+                continue
             hist = compute_technicals(hist)
             latest = hist.iloc[-1]
             latest["days_since_high20"] = days_since_high20(hist)
 
             # 技术分/入场
-            eflag = entry_flag(latest, args.ma20_band_low, args.ma20_band_high, args.rsi_low, args.rsi_high, args.days_since_high20_max)
-            tscore = tech_score(latest, args.ma20_band_low, args.ma20_band_high, args.rsi_low, args.rsi_high, args.days_since_high20_max)
+            eflag = entry_flag(
+                latest, args.ma20_band_low, args.ma20_band_high,
+                args.rsi_low, args.rsi_high, args.days_since_high20_max
+            )
+            tscore = tech_score(
+                latest, args.ma20_band_low, args.ma20_band_high,
+                args.rsi_low, args.rsi_high, args.days_since_high20_max
+            )
 
             # 资金原始因子
             vol_ratio = float(latest["volume"] / latest["vol_ma20"]) if latest.get("vol_ma20") and latest["vol_ma20"] else 0.0
@@ -399,9 +519,10 @@ def main() -> None:
     df = pd.DataFrame(rows)
     if df.empty:
         print("[warn] 没有可展示的数据。")
-        out_dir = "reports"; os.makedirs(out_dir, exist_ok=True)
-        pd.DataFrame([{"提示":"没有符合条件的股票或数据不足"}]).to_csv(
-            os.path.join(out_dir,"placeholder_empty.csv"), index=False, encoding="utf-8-sig"
+        out_dir = "reports"
+        os.makedirs(out_dir, exist_ok=True)
+        pd.DataFrame([{"提示": "没有符合条件的股票或数据不足"}]).to_csv(
+            os.path.join(out_dir, "placeholder_empty.csv"), index=False, encoding="utf-8-sig"
         )
         return
 
@@ -410,58 +531,71 @@ def main() -> None:
         df = df[df["EntryFlag"] == 1].copy()
         if df.empty:
             print("[info] 只看入场：无满足条件的个股。")
-            out_dir = "reports"; os.makedirs(out_dir, exist_ok=True)
-            pd.DataFrame([{"提示":"只看入场：本次无满足条件的个股"}]).to_csv(
-                os.path.join(out_dir,"placeholder_entry_only.csv"), index=False, encoding="utf-8-sig"
+            out_dir = "reports"
+            os.makedirs(out_dir, exist_ok=True)
+            pd.DataFrame([{"提示": "只看入场：本次无满足条件的个股"}]).to_csv(
+                os.path.join(out_dir, "placeholder_entry_only.csv"), index=False, encoding="utf-8-sig"
             )
             return
 
     # 5) 资金分/基本面分（z 标准化后线性组合）
     # FlowScore = z(vol_ratio) + 0.5*z(turnover_raw) + 0.5*z(hsgt_hits)
-    for col in ["vol_ratio","turnover_raw","hsgt_hits"]:
-        if col not in df.columns: df[col] = 0.0
+    for col in ["vol_ratio", "turnover_raw", "hsgt_hits"]:
+        if col not in df.columns:
+            df[col] = 0.0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-    df["FlowScore"] = zscore(df["vol_ratio"]) + 0.5*zscore(df["turnover_raw"]) + 0.5*zscore(df["hsgt_hits"])
+    df["FlowScore"] = zscore(df["vol_ratio"]) + 0.5 * zscore(df["turnover_raw"]) + 0.5 * zscore(df["hsgt_hits"])
 
     # FundScore = z(roe) + 0.5*z(rev_yoy) + 0.5*z(profit_yoy) - 0.5*z(debt_ratio)
-    for col in ["roe","rev_yoy","profit_yoy","debt_ratio"]:
-        if col not in df.columns: df[col] = 0.0
+    for col in ["roe", "rev_yoy", "profit_yoy", "debt_ratio"]:
+        if col not in df.columns:
+            df[col] = 0.0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-    df["FundScore"] = zscore(df["roe"]) + 0.5*zscore(df["rev_yoy"]) + 0.5*zscore(df["profit_yoy"]) - 0.5*zscore(df["debt_ratio"])
+    df["FundScore"] = zscore(df["roe"]) + 0.5 * zscore(df["rev_yoy"]) + 0.5 * zscore(df["profit_yoy"]) - 0.5 * zscore(df["debt_ratio"])
 
     # 6) 归一化综合分
-    for col in ["TechScore","IndustryScore","FlowScore","FundScore"]:
-        if col not in df.columns: df[col] = 0.0
+    for col in ["TechScore", "IndustryScore", "FlowScore", "FundScore"]:
+        if col not in df.columns:
+            df[col] = 0.0
         df[col] = df[col].fillna(df[col].median()) if not df[col].dropna().empty else 0.0
 
     df["z_tech"] = zscore(df["TechScore"])
-    df["z_ind"]  = zscore(df["IndustryScore"])
+    df["z_ind"] = zscore(df["IndustryScore"])
     df["z_flow"] = zscore(df["FlowScore"])
     df["z_fund"] = zscore(df["FundScore"])
 
-    composite = args.w_ind*df["z_ind"] + args.w_flow*df["z_flow"] + args.w_fund*df["z_fund"] + args.w_tech*df["z_tech"]
+    composite = args.w_ind * df["z_ind"] + args.w_flow * df["z_flow"] + args.w_fund * df["z_fund"] + args.w_tech * df["z_tech"]
     # 预留 ML：
     if not args.no_ml and "up_prob" in df.columns:
-        df["z_ml"] = zscore(df["up_prob"]); composite += args.w_ml*df["z_ml"]
+        df["z_ml"] = zscore(df["up_prob"])
+        composite += args.w_ml * df["z_ml"]
     df["Composite"] = composite
 
-    # 7) 每行业 TopN 截断 → 再整体排序
+    # 7) 每行业 TopN 截断 → 再整体排序（只有 industry 有效时才截断）
     df.sort_values("Composite", ascending=False, inplace=True)
-    if args.per_industry_top and args.per_industry_top > 0:
-        df = (df.groupby("industry", dropna=False, group_keys=False)
-                .apply(lambda x: x.head(args.per_industry_top))
-                .reset_index(drop=True))
-    df.sort_values(["Composite","change_pct"], ascending=[False, False], inplace=True)
+    if args.per_industry_top and args.per_industry_top > 0 and df["industry"].notna().any():
+        df = (
+            df.groupby("industry", dropna=False, group_keys=False)
+            .apply(lambda x: x.head(args.per_industry_top))
+            .reset_index(drop=True)
+        )
+    df.sort_values(["Composite", "change_pct"], ascending=[False, False], inplace=True)
     df.reset_index(drop=True, inplace=True)
     df["Final Rank"] = df.index + 1
 
     # 8) 报表
     display_df = df.head(20)
-    ind_display = ind_scores[["turnover_delta5","return5","IndustryScore"]] if not ind_scores.empty else \
-                  pd.DataFrame(columns=["Δ5日成交额","5日涨幅","行业得分"])
+    ind_display = (
+        ind_scores[["turnover_delta5", "return5", "IndustryScore"]]
+        if not ind_scores.empty
+        else pd.DataFrame(columns=["Δ5日成交额", "5日涨幅", "行业得分"])
+    )
     generate_report(today.strftime("%Y-%m-%d"), display_df, ind_display)
 
-    print(f"done. universe={len(spot)}, after filters={len(df)}, top industries: {', '.join(top_industries) if top_industries else 'N/A'}")
+    print(
+        f"done. universe={len(spot)}, after filters={len(df)}, "
+        f"top industries: {', '.join(top_industries) if top_industries else 'N/A'}"
+    )
 
 
 if __name__ == "__main__":
