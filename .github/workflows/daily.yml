@@ -21,6 +21,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install deps
         run: |
@@ -29,9 +30,8 @@ jobs:
 
       - name: Run daily analysis
         run: |
-          python run_daily.py --top 300 --ind-top-k 5 --per-industry-top 2
-          # 只看入场信号=1 的票可改为：
-          # python run_daily.py --top 300 --ind-top-k 5 --per-industry-top 2 --entry-only
+          # 这是“当前脚本已支持”的安全参数组合
+          python run_daily.py --top 300 --ind-top-k 5
 
       - name: Upload report artifacts
         uses: actions/upload-artifact@v4
