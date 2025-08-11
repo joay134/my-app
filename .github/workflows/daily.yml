@@ -30,7 +30,6 @@ jobs:
 
       - name: Run daily analysis
         run: |
-          # 这是“当前脚本已支持”的安全参数组合
           python run_daily.py --top 300 --ind-top-k 5
 
       - name: Upload report artifacts
