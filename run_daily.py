@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-A 股日选股分析（行业→资金→基本面→技术，含入场/每行业TopN，中文报表、网络容错、参数摘要、行业样本数、财务多源兜底）
+A 股日选股分析（行业→资金→基本面→技术，含入场/每行业TopN，中文报表、网络容错、参数摘要、行业样本数、财务多源兜底、次日上涨概率）
 """
 
 from __future__ import annotations
@@ -10,12 +10,21 @@ import argparse
 import datetime as dt
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 import akshare as ak
 import numpy as np
 import pandas as pd
 from jinja2 import Template
+
+# --- 机器学习 ---
+try:
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.linear_model import LogisticRegression
+    SKLEARN_OK = True
+except Exception as _:
+    SKLEARN_OK = False
 
 
 # ---------------------- 通用 ----------------------
@@ -220,7 +229,7 @@ def compute_industry_scores(spot: pd.DataFrame, top_k: int) -> pd.DataFrame:
     return ind_df.head(top_k)
 
 
-# ---------------------- 历史/技术 ----------------------
+# ---------------------- 历史/技术（含MACD） ----------------------
 
 def fetch_history(code: str, start: str, end: str) -> pd.DataFrame:
     df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
@@ -232,26 +241,41 @@ def fetch_history(code: str, start: str, end: str) -> pd.DataFrame:
     return df
 
 
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
 def compute_technicals(df: pd.DataFrame) -> pd.DataFrame:
     df["MA20"] = df["close"].rolling(20).mean()
     df["MA60"] = df["close"].rolling(60).mean()
 
+    # RSI14
     delta = df["close"].diff()
     gain = np.where(delta > 0, delta, 0)
     loss = np.where(delta < 0, -delta, 0)
     avg_gain = pd.Series(gain, index=df.index).rolling(14).mean()
     avg_loss = pd.Series(loss, index=df.index).rolling(14).mean()
-    rs = avg_gain / avg_loss
+    rs = avg_gain / (avg_loss.replace(0, np.nan))
     df["RSI14"] = 100 - (100 / (1 + rs))
 
+    # 量均线、20日高
     df["vol_ma20"] = df["volume"].rolling(20).mean()
     df["20d_high"] = df["close"].rolling(20).max().shift(1)
 
+    # ATR14
     tr = pd.concat(
         [df["high"] - df["low"], (df["high"] - df["close"].shift()).abs(), (df["low"] - df["close"].shift()).abs()],
         axis=1
     ).max(axis=1)
     df["ATR14"] = tr.rolling(14).mean()
+
+    # MACD（12,26,9），hist = dif - dea
+    ema12 = _ema(df["close"], 12)
+    ema26 = _ema(df["close"], 26)
+    dif = ema12 - ema26
+    dea = _ema(dif, 9)
+    df["MACD_hist"] = dif - dea
+
     return df
 
 
@@ -301,8 +325,7 @@ def northbound_top10_hits(code: str, days: int = 10) -> int:
 # ---------------------- 基本面（多源兜底） ----------------------
 
 def _latest_from_row(row_df: pd.DataFrame) -> Optional[float]:
-    """从财务宽表里取最近一期有值的数字"""
-    if row_df.empty:
+    if row_df is None or row_df.empty:
         return None
     cols = [c for c in row_df.columns if c not in ("指标", "科目", "item")]
     for c in cols:  # 列一般按最近→最远
@@ -330,7 +353,6 @@ def _pick_from_table(df: pd.DataFrame, keys: List[str]) -> Optional[float]:
 
 
 def _try_fin_tables(code: str) -> List[pd.DataFrame]:
-    """尝试多个财务接口，返回可能的宽表列表"""
     tables: List[pd.DataFrame] = []
     # 1) 东财-财务分析指标
     try:
@@ -359,24 +381,17 @@ def _try_fin_tables(code: str) -> List[pd.DataFrame]:
 
 
 def fetch_fundamentals(code: str) -> dict:
-    """
-    返回 {'roe':..., 'rev_yoy':..., 'profit_yoy':..., 'debt_ratio':...}
-    多源兜底；取最近一期有值。
-    """
     out = {"roe": 0.0, "rev_yoy": 0.0, "profit_yoy": 0.0, "debt_ratio": 0.0}
     tables = _try_fin_tables(code)
-
     if not tables:
         return out
 
-    # 不同接口的关键词集合（尽量覆盖）
     key_map = {
         "roe": ["净资产收益率", "ROE", "净资产收益率-加权", "ROE(加权)"],
         "rev_yoy": ["营业总收入同比", "主营业务收入同比", "营业收入同比", "营业总收入增长率", "营业收入增长率"],
         "profit_yoy": ["净利润同比", "归母净利润同比", "净利润增长率", "归属于母公司股东的净利润同比增长"],
-        "debt_ratio": ["资产负债率", "负债率", "资产负债率(%)", "资产负债率-平均"]
+        "debt_ratio": ["资产负债率", "负债率", "资产负债率(%)", "资产负债率-平均"],
     }
-
     for k, kws in key_map.items():
         val = None
         for tb in tables:
@@ -385,13 +400,105 @@ def fetch_fundamentals(code: str) -> dict:
                 break
         if val is not None:
             out[k] = float(val)
-
     return out
+
+
+# ---------------------- ML 特征 & 训练 ----------------------
+
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    用单个股票的历史（已含compute_technicals）构造特征：
+    特征均滞后1日：ret1, ret5, volume_change, macd_hist, rsi14,
+                 close/ma20-1, close/ma60-1, gap_to_20d_high(close/high20-1)
+    目标：next_day_return > 0
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    feats = pd.DataFrame(index=df.index)
+    # 收益
+    feats["ret1"] = df["close"].pct_change(1)
+    feats["ret5"] = df["close"].pct_change(5)
+    # 量能比
+    feats["volume_change"] = df["volume"] / df["vol_ma20"] - 1
+    # MACD 柱
+    feats["macd_hist"] = df["MACD_hist"]
+    # RSI
+    feats["rsi14"] = df["RSI14"]
+    # 价格相对均线
+    feats["close_ma20"] = df["close"] / df["MA20"] - 1
+    feats["close_ma60"] = df["close"] / df["MA60"] - 1
+    # 距离20日高
+    feats["gap_to_20d_high"] = df["close"] / df["20d_high"] - 1
+
+    # 特征滞后一天
+    feats = feats.shift(1)
+
+    # 标签：次日涨跌
+    next_ret = df["close"].pct_change(1).shift(-1)
+    feats["y"] = (next_ret > 0).astype(int)
+
+    # 丢空
+    feats = feats.dropna()
+    return feats
+
+
+def fit_cross_section(hist_map: Dict[str, pd.DataFrame], min_rows: int = 120) -> Optional[Pipeline]:
+    """把多个股票的特征拼接训练一个逻辑回归模型；返回 sklearn Pipeline。"""
+    if not SKLEARN_OK:
+        print("[warn] scikit-learn 不可用，跳过 ML。")
+        return None
+
+    X_list, y_list = [], []
+    for code, h in hist_map.items():
+        if h is None or h.empty:
+            continue
+        feats = build_features(h)
+        if feats.shape[0] < min_rows:
+            continue
+        y = feats["y"].values.astype(int)
+        X = feats.drop(columns=["y"]).values
+        X_list.append(X)
+        y_list.append(y)
+
+    if not X_list:
+        print("[warn] ML 无足够样本，跳过。")
+        return None
+
+    X_all = np.vstack(X_list)
+    y_all = np.concatenate(y_list)
+    print(f"training samples: {len(X_all)}")
+
+    try:
+        model = Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=1000, class_weight="balanced", random_state=42))
+        ])
+        model.fit(X_all, y_all)
+        return model
+    except Exception as e:
+        print(f"[warn] ML 训练失败：{e}")
+        return None
+
+
+def predict_up_prob_last(df: pd.DataFrame, model: Optional[Pipeline]) -> Optional[float]:
+    """用单只股票的‘最后一行特征’做预测（等于对“明天”的概率预测）；失败返回 None"""
+    if model is None or df is None or df.empty:
+        return None
+    feats = build_features(df)
+    if feats.empty:
+        return None
+    X_last = feats.drop(columns=["y"]).iloc[[-1]].values
+    try:
+        prob = model.predict_proba(X_last)[0, 1]
+        return float(prob)
+    except Exception:
+        return None
 
 
 # ---------------------- 报告 ----------------------
 
-def _param_summary(args, total_universe: int, kept_universe: int) -> pd.DataFrame:
+def _param_summary(args, total_universe: int, kept_universe: int, ml_enabled: bool, train_samples: int) -> pd.DataFrame:
     return pd.DataFrame([
         ["运行时间", dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
         ["候选数量 top", args.top],
@@ -402,6 +509,8 @@ def _param_summary(args, total_universe: int, kept_universe: int) -> pd.DataFram
         ["RSI区间", f"{args.rsi_low} ~ {args.rsi_high}"],
         ["距20日新高上限", args.days_since_high20_max],
         ["权重 w-ind/w-flow/w-fund/w-tech", f"{args.w_ind}/{args.w_flow}/{args.w_fund}/{args.w_tech}"],
+        ["ML(上涨概率)", "启用" if ml_enabled else "停用"],
+        ["训练样本(条)", train_samples],
         ["原始池大小", total_universe],
         ["过滤后样本", kept_universe],
     ], columns=["参数", "取值"])
@@ -416,12 +525,13 @@ def generate_report(date_str: str, stocks: pd.DataFrame, industries: pd.DataFram
         "close": "收盘", "change_pct": "涨跌幅",
         "IndustryScore": "行业得分", "FlowScore": "资金分", "FundScore": "基本面分",
         "TechScore": "技术分", "EntryFlag": "入场信号",
+        "up_prob": "上涨概率(Up Prob)",
         "Composite": "综合分", "Final Rank": "最终排名",
     }
     out_cols = [
         "code", "name", "industry", "close", "change_pct",
         "IndustryScore", "FlowScore", "FundScore", "TechScore", "EntryFlag",
-        "Composite", "Final Rank",
+        "up_prob", "Composite", "Final Rank",
     ]
     df_csv = stocks.copy()
     for c in out_cols:
@@ -452,7 +562,7 @@ th:first-child,td:first-child{text-align:left}
 <div class="card">
   <b>本次参数摘要</b>
   {{ params | safe }}
-  <div class="hint">说明：若“基本面分”一列为 0，多半是数据源暂不可用，代码已自动降级处理，不影响其他因子。</div>
+  <div class="hint">说明：若“基本面分”为0，多半是数据源暂不可用；ML 若停用或样本不足时，“上涨概率”列为空，综合排名仅依赖因子。</div>
 </div>
 
 <h2>行业热度</h2>
@@ -491,9 +601,10 @@ def main() -> None:
     p.add_argument("--w-flow", type=float, default=0.30)
     p.add_argument("--w-fund", type=float, default=0.20)
     p.add_argument("--w-tech", type=float, default=0.20)
-    p.add_argument("--w-ml", type=float, default=0.00)
-    p.add_argument("--no-ml", action="store_true")
+    p.add_argument("--w-ml", type=float, default=0.40)  # 仅用于 rank 融合时的可读性（实际用 0.6/0.4 的名次融合）
 
+    # 机器学习
+    p.add_argument("--no-ml", action="store_true", help="禁用上涨概率模型")
     args = p.parse_args()
 
     today = dt.date.today()
@@ -524,6 +635,7 @@ def main() -> None:
 
     # 4) 逐股：历史/技术 + 资金原始因子 + 基本面原始因子
     rows = []
+    hist_cache: Dict[str, pd.DataFrame] = {}
     for _, r in spot.iterrows():
         # 仅保留热门行业；若没有行业映射/行业打分，则不过滤
         if top_industries and r["industry"] not in top_industries:
@@ -534,8 +646,8 @@ def main() -> None:
             if hist.empty:
                 continue
             hist = compute_technicals(hist)
+            hist["days_since_high20"] = days_since_high20(hist)
             latest = hist.iloc[-1]
-            latest["days_since_high20"] = days_since_high20(hist)
 
             # 技术分/入场
             eflag = entry_flag(
@@ -555,6 +667,7 @@ def main() -> None:
             # 基本面原始因子（多源兜底）
             fin = fetch_fundamentals(code)
 
+            hist_cache[code] = hist  # 训练时复用
             rows.append({
                 "code": code, "name": r["name"], "industry": r["industry"],
                 "close": latest["close"], "change_pct": r.get("change_pct", np.nan),
@@ -615,12 +728,34 @@ def main() -> None:
     df["z_fund"] = zscore(df["FundScore"])
 
     composite = args.w_ind * df["z_ind"] + args.w_flow * df["z_flow"] + args.w_fund * df["z_fund"] + args.w_tech * df["z_tech"]
-    if not args.no_ml and "up_prob" in df.columns:
-        df["z_ml"] = zscore(df["up_prob"])
-        composite += args.w_ml * df["z_ml"]
     df["Composite"] = composite
 
-    # 7) 每行业 TopN 截断 → 再整体排序（只有 industry 有效时才截断）
+    # 7) 训练 ML（若启用）
+    model = None
+    train_samples = 0
+    ml_enabled = (not args.no_ml) and SKLEARN_OK
+    if ml_enabled:
+        model = fit_cross_section(hist_cache, min_rows=120)
+        if model is None:
+            ml_enabled = False
+        else:
+            # 统计训练样本数量（打印时由 fit_cross_section 打过日志，这里再估算一遍）
+            for h in hist_cache.values():
+                feats = build_features(h)
+                if feats.shape[0] >= 120:
+                    train_samples += feats.shape[0]
+
+    # 8) 逐股计算 Up Prob
+    df["up_prob"] = np.nan
+    if ml_enabled and model is not None:
+        for i, r in df.iterrows():
+            code = r["code"]
+            h = hist_cache.get(code)
+            prob = predict_up_prob_last(h, model) if h is not None else None
+            if prob is not None:
+                df.at[i, "up_prob"] = prob
+
+    # 9) 每行业 TopN 截断 → 再整体排序
     df.sort_values("Composite", ascending=False, inplace=True)
     if args.per_industry_top and args.per_industry_top > 0 and df["industry"].notna().any():
         df = (
@@ -628,23 +763,39 @@ def main() -> None:
             .apply(lambda x: x.head(args.per_industry_top))
             .reset_index(drop=True)
         )
-    df.sort_values(["Composite", "change_pct"], ascending=[False, False], inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    df["Final Rank"] = df.index + 1
 
-    # 8) 报表（带参数摘要）
+    # 融合排名：0.6 * 综合分名次 + 0.4 * Up Prob 名次（Up Prob 缺失则只用综合分名次）
+    rank_comp = df["Composite"].rank(ascending=False, method="min")
+    if df["up_prob"].notna().any():
+        rank_prob = df["up_prob"].rank(ascending=False, method="min")
+        final_score = 0.6 * rank_comp + 0.4 * rank_prob
+    else:
+        final_score = rank_comp
+
+    df["Final Rank"] = final_score.rank(ascending=True, method="min").astype(int)
+    df.sort_values(["Final Rank", "Composite"], ascending=[True, False], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # 10) 报表（带参数摘要）
     display_df = df.head(20)
+    # 行业显示
     ind_display = (
         ind_scores[["turnover_delta5", "return5", "IndustryScore", "count"]]
         if not ind_scores.empty
         else pd.DataFrame(columns=["Δ5日成交额", "5日涨幅", "行业得分", "样本数"])
     )
-    params_df = _param_summary(args, total_universe=len(spot), kept_universe=len(df))
+    params_df = _param_summary(
+        args,
+        total_universe=len(spot),
+        kept_universe=len(df),
+        ml_enabled=ml_enabled,
+        train_samples=train_samples
+    )
     generate_report(today.strftime("%Y-%m-%d"), display_df, ind_display, params_df)
 
     print(
         f"done. universe={len(spot)}, after filters={len(df)}, "
-        f"top industries: {', '.join(top_industries) if top_industries else 'N/A'}"
+        f"top industries: {', '.join(ind_display.index.astype(str)) if not ind_display.empty else 'N/A'}"
     )
 
 
