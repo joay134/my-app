@@ -30,8 +30,12 @@ jobs:
       - name: Run daily analysis
         run: |
           python run_daily.py --top 300 --ind-top-k 5 --per-industry-top 2
-          # 只看入场信号=1 的票，可改为：
+          # 只看入场信号=1 的票可改为：
           # python run_daily.py --top 300 --ind-top-k 5 --per-industry-top 2 --entry-only
 
       - name: Upload report artifacts
-        uses: actions/
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-report
+          path: reports/*
+          if-no-files-found: warn
