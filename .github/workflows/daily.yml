@@ -2,7 +2,8 @@ name: Daily Analysis
 
 on:
   schedule:
-    - cron: '30 9 * * 1-5'   # 09:30 UTC = 北京时间 17:30（工作日）
+    # 09:30 UTC = 北京时间 17:30（工作日）
+    - cron: '30 9 * * 1-5'
   workflow_dispatch:
 
 permissions:
@@ -13,9 +14,11 @@ jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -25,10 +28,10 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run daily analysis
-        run: python run_daily.py --top 100 --out ./reports
+        run: |
+          python run_daily.py --top 300 --ind-top-k 5 --per-industry-top 2
+          # 只看入场信号=1 的票，可改为：
+          # python run_daily.py --top 300 --ind-top-k 5 --per-industry-top 2 --entry-only
 
       - name: Upload report artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: daily-report
-          path: reports/*
+        uses: actions/
