@@ -28,15 +28,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'  # 缓存 pip 依赖，加速执行
+          cache: 'pip'   # 缓存 pip 依赖，加速执行
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
+          # 关键：确保 scikit-learn 存在（即使 requirements.txt 漏写也能装上）
+          pip install "scikit-learn>=1.4,<1.6"
 
       - name: Run daily analysis
-        # 在这里改运行参数更方便
+        # 在这里改运行参数最方便
         env:
           RUN_ARGS: >-
             --top 500
