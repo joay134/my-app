@@ -36,22 +36,21 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run daily analysis
-        env:
-          RUN_ARGS: >-
-            --top 600
-            --ind-top-k 10
-            --per-industry-top 4
-            --ml-lookback-days 1200
-            --ml-min-rows 50
-            --eval-days 60
-            # 调高模型权重一点（可按需调整）
-            --w-ml 0.40
-            # 稳定期先不要硬过滤，观察一段时间后再加：
-            # --entry-only
         run: |
           set -e
+          # 语法检查（可选）
           python -m py_compile run_daily.py
-          python run_daily.py $RUN_ARGS
+          # —— 真正运行参数（可按需调整）——
+          python run_daily.py \
+            --top 600 \
+            --ind-top-k 10 \
+            --per-industry-top 4 \
+            --ml-lookback-days 1200 \
+            --ml-min-rows 50 \
+            --eval-days 60 \
+            --w-ml 0.40
+          # 只看“入场信号=1”的票时，改用下面这一行（把上面那行注释掉）：
+          # python run_daily.py --top 600 --ind-top-k 10 --per-industry-top 4 --ml-lookback-days 1200 --ml-min-rows 50 --eval-days 60 --w-ml 0.40 --entry-only
 
       - name: Upload report artifacts
         uses: actions/upload-artifact@v4
