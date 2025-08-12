@@ -49,10 +49,18 @@ jobs:
             --entry-only
         run: |
           set -e
-          # 语法检查（可选）
           python -m py_compile run_daily.py
-          # 真正运行
           python run_daily.py $RUN_ARGS
+
+      # 兜底：如果没有生成任何报告，自动写一份“无候选”的占位报告，保证有 Artifact 可下载
+      - name: Ensure reports (fallback when empty)
+        run: |
+          mkdir -p reports
+          if [ -z "$(ls -A reports 2>/dev/null)" ]; then
+            D=$(date +%F)
+            echo "<html><head><meta charset='utf-8'><title>Daily Report ${D}</title></head><body><h1>无候选股票</h1><p>今日没有满足入场条件的个股。</p><p>参数：${RUN_ARGS}</p></body></html>" > reports/report_${D}.html
+            printf "message\n无候选股票（参数：%s）\n" "${RUN_ARGS}" > reports/report_${D}.csv
+          fi
 
       - name: Upload report artifacts
         uses: actions/upload-artifact@v4
