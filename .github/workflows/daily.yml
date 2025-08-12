@@ -2,17 +2,24 @@ name: Daily Analysis
 
 on:
   schedule:
-    # 09:30 UTC = 北京时间 17:30（工作日）
+    # 每个工作日 09:30 UTC 触发（= 北京时间 17:30）
     - cron: '30 9 * * 1-5'
+  # 允许在 Actions 页面手动触发
   workflow_dispatch:
 
 permissions:
   contents: read
-  actions: write
+
+# 同一分支保证只运行一个实例
+concurrency:
+  group: daily-analysis-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,16 +28,29 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          cache: 'pip'  # 缓存 pip 依赖，加速执行
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run daily analysis
+        # 在这里改运行参数更方便
+        env:
+          RUN_ARGS: >-
+            --top 500
+            --ind-top-k 8
+            --per-industry-top 3
+            --ml-lookback-days 1200
+            --ml-min-rows 50
+            --entry-only
         run: |
-          python run_daily.py --top 300 --ind-top-k 5
+          set -e
+          # 语法检查（可选）
+          python -m py_compile run_daily.py
+          # 真正运行
+          python run_daily.py $RUN_ARGS
 
       - name: Upload report artifacts
         uses: actions/upload-artifact@v4
@@ -38,3 +58,4 @@ jobs:
           name: daily-report
           path: reports/*
           if-no-files-found: warn
+          retention-days: 7
