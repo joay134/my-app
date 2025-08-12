@@ -2,14 +2,12 @@ name: Daily Analysis
 
 on:
   schedule:
-    # 每个工作日 09:30 UTC 触发（= 北京时间 17:30）
-    - cron: '30 9 * * 1-5'
+    - cron: '30 9 * * 1-5'   # 工作日 09:30 UTC
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# 保证同一分支只跑一个实例
 concurrency:
   group: daily-analysis-${{ github.ref }}
   cancel-in-progress: false
@@ -17,15 +15,14 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    # 把超时拉到 120 分钟，避免长任务被系统提前杀掉
     timeout-minutes: 120
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---------- 关键：添加 4GB 交换空间，缓解内存紧张 ----------
-      - name: Add 4G swap (prevent OOM kill)
+      # 4G 交换区，缓解 OOM
+      - name: Add 4G swap (prevent OOM)
         run: |
           sudo fallocate -l 4G /swapfile
           sudo chmod 600 /swapfile
@@ -33,12 +30,6 @@ jobs:
           sudo swapon /swapfile
           free -h
 
-      # 可选：提高可打开文件数，少数场景能避免一些奇怪的中断
-      - name: Bump file descriptors limit
-        run: |
-          ulimit -n 4096 || true
-
-      # ---------- 缓存 pip & AkShare 数据，加速后续运行 ----------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -60,37 +51,32 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -c "import sys,platform;print('Python',sys.version,'on',platform.platform())"
 
       - name: Prepare report dir
-        run: |
-          mkdir -p reports
+        run: mkdir -p reports
 
-      # ---------- 运行参数：继续“重”配置，但有 swap/更长超时兜底 ----------
-      - name: Run daily analysis (heavy but safe)
+      # —— Lite-Safe 参数：先稳定产出，再逐步加大 ——
+      - name: Run daily analysis (lite-safe)
         env:
-          # 可按需调整；先保持你想要的精度配置
           RUN_ARGS: >-
-            --top 600
-            --ind-top-k 10
-            --per-industry-top 4
-            --ml-lookback-days 1200
+            --top 350
+            --ind-top-k 6
+            --per-industry-top 3
+            --ml-lookback-days 720
             --ml-min-rows 50
-            --eval-days 60
-            --w-ml 0.40
+            --eval-days 40
+            --w-ml 0.35
+            --max-train-samples 60000
         run: |
           set -e
           python -m py_compile run_daily.py
-          # 持续输出日志到文件，方便定位问题
           python -u run_daily.py $RUN_ARGS 2>&1 | tee reports/runtime.log
 
-      # 失败也上传日志，便于排查
       - name: Upload report artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: daily-report
-          path: |
-            reports/*
+          path: reports/*
           if-no-files-found: warn
           retention-days: 14
