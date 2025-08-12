@@ -1,4 +1,4 @@
-name: Daily Analysis (signal + discovery)
+name: Daily Analysis
 
 on:
   schedule:
@@ -10,38 +10,15 @@ on:
 permissions:
   contents: read
 
-# 同一分支只运行一个实例
+# 同一分支只跑一个实例
 concurrency:
   group: daily-analysis-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  analyze:
-    name: Daily Analysis - ${{ matrix.id }}
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # A. 信号版（更精准，用于实际下单）
-          - id: signal
-            run_args: >-
-              --top 600
-              --ind-top-k 10
-              --per-industry-top 4
-              --ml-lookback-days 1200
-              --ml-min-rows 40
-              --entry-only
-          # B. 发现版（覆盖更广，用于浏览与研究）
-          - id: discovery
-            run_args: >-
-              --top 700
-              --ind-top-k 12
-              --per-industry-top 5
-              --ml-lookback-days 1200
-              --ml-min-rows 40
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
@@ -58,32 +35,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run ${{ matrix.id }} analysis
+      - name: Run daily analysis
         env:
-          RUN_ARGS: ${{ matrix.run_args }}
-          MATRIX_ID: ${{ matrix.id }}
+          RUN_ARGS: >-
+            --top 600
+            --ind-top-k 10
+            --per-industry-top 4
+            --ml-lookback-days 1200
+            --ml-min-rows 50
+            --eval-days 60
+            # 调高模型权重一点（可按需调整）
+            --w-ml 0.40
+            # 稳定期先不要硬过滤，观察一段时间后再加：
+            # --entry-only
         run: |
           set -e
-          # 语法检查（可选）
           python -m py_compile run_daily.py
-
-          # 清理并运行
-          rm -rf reports || true
           python run_daily.py $RUN_ARGS
 
-          # 将本轮产出移到独立目录，避免两套报告互相覆盖
-          OUTDIR="reports_${MATRIX_ID}"
-          mkdir -p "$OUTDIR"
-          if compgen -G "reports/*" > /dev/null; then
-            mv reports/* "$OUTDIR"/
-          else
-            echo "No files generated for ${MATRIX_ID} at $(date -u '+%F %T') UTC" > "$OUTDIR/README.txt"
-          fi
-
-      - name: Upload ${{ matrix.id }} artifacts
+      - name: Upload report artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: daily-report-${{ matrix.id }}
-          path: reports_${{ matrix.id }}/*
+          name: daily-report
+          path: reports/*
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 14
