@@ -10,7 +10,7 @@ on:
 permissions:
   contents: read
 
-# 同一分支只跑一个实例
+# 同一分支只跑一个实例：新的触发会排队，不会取消正在运行的任务
 concurrency:
   group: daily-analysis-${{ github.ref }}
   cancel-in-progress: false
@@ -18,7 +18,8 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # 放宽超时时间，避免长时间训练或数据源变慢时被系统中断
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
@@ -29,6 +30,7 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         run: |
@@ -36,26 +38,36 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run daily analysis
+        env:
+          # —— 运行参数，与你当前一致；需要时只改这里即可 ——
+          RUN_ARGS: >-
+            --top 600
+            --ind-top-k 10
+            --per-industry-top 4
+            --ml-lookback-days 1200
+            --ml-min-rows 50
+            --eval-days 60
+            --w-ml 0.40
         run: |
-          set -e
+          set -euo pipefail
+          mkdir -p reports
+
           # 语法检查（可选）
           python -m py_compile run_daily.py
-          # —— 真正运行参数（可按需调整）——
-          python run_daily.py \
-            --top 600 \
-            --ind-top-k 10 \
-            --per-industry-top 4 \
-            --ml-lookback-days 1200 \
-            --ml-min-rows 50 \
-            --eval-days 60 \
-            --w-ml 0.40
-          # 只看“入场信号=1”的票时，改用下面这一行（把上面那行注释掉）：
-          # python run_daily.py --top 600 --ind-top-k 10 --per-industry-top 4 --ml-lookback-days 1200 --ml-min-rows 50 --eval-days 60 --w-ml 0.40 --entry-only
 
+          echo "Run at: $(date -u '+%Y-%m-%d %H:%M:%S %Z')" | tee reports/metadata.txt
+          echo "Args  : ${RUN_ARGS}" | tee -a reports/metadata.txt
+
+          # 实际运行，同时把完整日志保存下来
+          python run_daily.py ${RUN_ARGS} 2>&1 | tee reports/runtime.log
+
+      # 无论成功失败，都把生成物和日志拿回来，便于排错
       - name: Upload report artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: daily-report
-          path: reports/*
+          path: |
+            reports/**
           if-no-files-found: warn
           retention-days: 14
