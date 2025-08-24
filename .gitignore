@@ -1,0 +1,24 @@
+# virtual env
+.venv/
+venv/
+
+# python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# app outputs
+data/*.csv
+secrets/
+*.log
+
+# streamlit cache (保留 config.toml)
+.streamlit/*
+!.streamlit/config.toml
